@@ -1,0 +1,20 @@
+[project]
+name = "ezshare-cpap"
+version = "0.1.0"
+description = "A downloader for ResMed AirSense10 files from an ez Share SD card with firmware 4.4.0"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+dependencies = ["requests"]
+
+[project.scripts]
+download-cpap = "download_cpap:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+only-include = ["download_cpap.py"]
+
