@@ -43,15 +43,16 @@ DEFAULT_DAYS = 7
 CONFIRMED_FIRMWARE = "4.4.0"
 
 # EDF file types in DATALOG directories
-# EVE/CSL are written first (~8-9s before BRP/PLD/SAD)
+# EVE/CSL are written first (5-15s before BRP/PLD/SAD/SA2)
 DATALOG_TYPES_EARLY = ["EVE", "CSL"]
-DATALOG_TYPES_LATE = ["BRP", "PLD", "SAD"]
+DATALOG_TYPES_LATE = ["BRP", "PLD", "SAD", "SA2"]
 DATALOG_ALL_TYPES = DATALOG_TYPES_EARLY + DATALOG_TYPES_LATE
 
 ROOT_FILES = [
     "STR.edf",
     "STR.crc",
     "Identification.tgt",
+    "Identification.json",
     "Identification.crc",
     "journal.dat",
     "journal.jnl",
@@ -60,6 +61,8 @@ ROOT_FILES = [
 SETTINGS_FILES = [
     "sig.dat",
     "set.crc",
+    "CurrentSettings.json",
+    "CurrentSettings.crc",
 ]
 
 
@@ -168,7 +171,11 @@ def parse_str_edf(filepath):
 class EzShareCard:
     """Interface to ez Share WiFi SD card (firmware 4.4.0 compatible)."""
 
-    def __init__(self, ip=DEFAULT_CARD_IP, timeout=10):
+    def __init__(self, ip=DEFAULT_CARD_IP, timeout=8, chunk_size=8192, retries=5):
+        if timeout <= 0 or chunk_size <= 0 or retries < 0:
+            raise ValueError("timeout/chunk_size must be positive; retries must be nonnegative")
+        self.chunk_size = chunk_size
+        self.retries = retries
         self.base_url = f"http://{ip}"
         self.timeout = timeout
         self.session = requests.Session()
@@ -220,12 +227,12 @@ class EzShareCard:
         url = f"{self.base_url}/{path.lstrip('/')}"
         try:
             r = self.session.head(url, timeout=self.timeout, allow_redirects=False)
-            ct = r.headers.get("Content-Type", "")
-            if "text/html" in ct:
+            ct = r.headers.get("Content-Type", "").lower()
+            if r.status_code != 200 or "text/html" in ct:
                 return False, 0
             content_length = int(r.headers.get("Content-Length", 0))
             return True, content_length
-        except requests.RequestException:
+        except (requests.RequestException, ValueError):
             return False, 0
 
     def is_real_directory(self, path):
@@ -233,66 +240,100 @@ class EzShareCard:
         return exists and size == 0
 
     def download_file(self, remote_path, local_path, expected_size=None):
-        url = f"{self.base_url}/{remote_path.lstrip('/')}"
-        try:
-            r = self.session.get(url, timeout=self.timeout, stream=True)
+        """Append only complete, validated ranges; retain partial files for retry.
 
-            ct = r.headers.get("Content-Type", "")
-            if "text/html" in ct:
+        Resuming assumes the remote file and existing local prefix are unchanged.
+        """
+        if expected_size is None:
+            exists, expected_size = self.is_real_file(remote_path)
+            if not exists:
                 return False
-
-            os.makedirs(os.path.dirname(local_path), exist_ok=True)
-
-            with open(local_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    f.write(chunk)
-
-            actual_size = os.path.getsize(local_path)
-            if expected_size and actual_size != expected_size:
-                print(
-                    f"  WARNING: Size mismatch for {remote_path}: "
-                    f"expected {expected_size}, got {actual_size}"
-                )
-
-            return True
-
-        except requests.RequestException as e:
-            print(f"  ERROR downloading {remote_path}: {e}")
+        if expected_size < 0:
             return False
+        url = f"{self.base_url}/{remote_path.lstrip('/')}"
+        os.makedirs(os.path.dirname(os.fspath(local_path)) or ".", exist_ok=True)
+        offset = os.path.getsize(local_path) if os.path.exists(local_path) else 0
+        if offset > expected_size:
+            print(f"  ERROR: Local file is larger than {remote_path}; remove it to restart")
+            return False
+        with open(local_path, "ab") as f:
+            while offset < expected_size:
+                end = min(offset + self.chunk_size, expected_size) - 1
+                for attempt in range(self.retries + 1):
+                    try:
+                        with self.session.get(
+                            url, headers={"Range": f"bytes={offset}-{end}",
+                                          "Accept-Encoding": "identity"},
+                            timeout=self.timeout, stream=True,
+                            allow_redirects=False,
+                        ) as r:
+                            wanted = f"bytes {offset}-{end}/{expected_size}"
+                            # A range covering the whole file is answered with
+                            # a plain 200 and the full body on firmware 4.4.0.
+                            whole = (r.status_code == 200 and offset == 0
+                                     and end == expected_size - 1
+                                     and "Content-Range" not in r.headers)
+                            if ((r.status_code != 206 and not whole)
+                                    or (not whole and r.headers.get("Content-Range") != wanted)
+                                    or "text/html" in r.headers.get("Content-Type", "").lower()
+                                    or r.headers.get("Content-Encoding", "identity") != "identity"):
+                                raise ValueError("Invalid range response")
+                            length = end - offset + 1
+                            if ("Content-Length" in r.headers
+                                    and int(r.headers["Content-Length"]) != length):
+                                raise ValueError("Invalid Content-Length")
+                            data = bytearray()
+                            for chunk in r.iter_content(chunk_size=self.chunk_size):
+                                data.extend(chunk)
+                                if len(data) > length:
+                                    raise ValueError("Oversized range body")
+                            if len(data) != length:
+                                raise ValueError("Short range body")
+                        f.write(data)
+                        f.flush()
+                        offset += length
+                        break
+                    except (requests.RequestException, ValueError) as e:
+                        if attempt == self.retries:
+                            print(f"  ERROR downloading {remote_path} at {offset}: {e}")
+                            return False
+        return os.path.getsize(local_path) == expected_size
 
 
 # --- DATALOG Probing ---
 
 
 def find_seconds_for_type(card, dir_date, file_date, hhmm, ftype):
-    """Brute-force scan seconds 0-59 to find a DATALOG file.
+    """Brute-force scan the start minute plus 15 seconds to find a DATALOG file.
 
-    Returns (seconds_str, size) or (None, 0).
+    Returns (timestamp_str, size) or (None, 0).
     """
-    for ss in range(60):
-        path = f"DATALOG/{dir_date}/{file_date}_{hhmm}{ss:02d}_{ftype}.edf"
+    minute = datetime.strptime(file_date + hhmm, "%Y%m%d%H%M")
+    for ss in range(75):
+        timestamp = (minute + timedelta(seconds=ss)).strftime("%Y%m%d_%H%M%S")
+        path = f"DATALOG/{dir_date}/{timestamp}_{ftype}.edf"
         exists, size = card.is_real_file(path)
         if exists and size > 0:
-            return f"{ss:02d}", size
+            return timestamp, size
     return None, 0
 
 
 def find_seconds_near(card, dir_date, file_date, hhmm, ftype, reference_ss, window=15):
     """Search for a file's seconds value near a known reference.
 
-    Checks reference_ss first, then expands outward within +/-window.
+    Checks the reference timestamp first, then expands across minute/day boundaries.
     """
-    ref = int(reference_ss)
+    ref = datetime.strptime(reference_ss, "%Y%m%d_%H%M%S")
     for offset in range(window + 1):
-        candidates = [ref + offset] if offset == 0 else [ref + offset, ref - offset]
+        candidates = [ref + timedelta(seconds=offset)]
+        if offset:
+            candidates.append(ref - timedelta(seconds=offset))
         for candidate in candidates:
-            if candidate < 0 or candidate >= 60:
-                continue
-            ss_str = f"{candidate:02d}"
-            path = f"DATALOG/{dir_date}/{file_date}_{hhmm}{ss_str}_{ftype}.edf"
+            timestamp = candidate.strftime("%Y%m%d_%H%M%S")
+            path = f"DATALOG/{dir_date}/{timestamp}_{ftype}.edf"
             exists, size = card.is_real_file(path)
             if exists and size > 0:
-                return ss_str, size
+                return timestamp, size
     return None, 0
 
 
@@ -366,8 +407,8 @@ def download_datalog(card, sessions, output_dir, days_back=None):
     - Filename date = actual calendar date of session start
     - Filename time = HHMM from STR.edf + brute-forced seconds (0-59)
 
-    Strategy: find BRP seconds first (full 0-59 scan), then search +/-15s
-    for other types. EVE/CSL are typically ~8-9s earlier than BRP/PLD/SAD.
+    Find BRP in the start minute plus 15 seconds, then search +/-15s
+    across minute/day boundaries for other types. EVE/CSL are 5-15s earlier.
     """
     print("\n=== Downloading DATALOG files ===")
 
@@ -422,14 +463,16 @@ def download_datalog(card, sessions, output_dir, days_back=None):
             brp_ss, brp_size = find_seconds_for_type(
                 card, dir_date, file_date, hhmm, "BRP"
             )
-            total_probed += 60 if brp_ss is None else (int(brp_ss) + 1)
+            total_probed += 75 if brp_ss is None else int(
+                (datetime.strptime(brp_ss, "%Y%m%d_%H%M%S") - start.replace(second=0)).total_seconds()
+            ) + 1
 
             if brp_ss is None:
                 print("not found, skipping session")
                 total_not_found += len(DATALOG_ALL_TYPES)
                 continue
 
-            print(f"found SS={brp_ss}")
+            print(f"found {brp_ss}")
 
             files_to_download = [("BRP", brp_ss, brp_size)]
 
@@ -452,7 +495,7 @@ def download_datalog(card, sessions, output_dir, days_back=None):
                     files_to_download.append((ftype, ss, size))
 
             for ftype, ss, size in files_to_download:
-                basename = f"{file_date}_{hhmm}{ss}_{ftype}"
+                basename = f"{ss}_{ftype}"
                 remote_edf = f"DATALOG/{dir_date}/{basename}.edf"
                 remote_crc = f"DATALOG/{dir_date}/{basename}.crc"
                 local_edf = os.path.join(output_dir, remote_edf)
@@ -535,15 +578,22 @@ Examples:
     parser.add_argument(
         "--timeout",
         type=int,
-        default=10,
-        help="HTTP request timeout in seconds (default: 10)",
+        default=8,
+        help="HTTP request timeout in seconds (default: 8)",
     )
+    parser.add_argument("--chunk-size", type=int, default=8192,
+                        help="Range size in bytes (default: 8192)")
+    parser.add_argument("--retries", type=int, default=5,
+                        help="Retries per range after the first attempt (default: 5)")
     args = parser.parse_args()
+    if args.timeout <= 0 or args.chunk_size <= 0 or args.retries < 0:
+        parser.error("timeout/chunk-size must be positive; retries must be nonnegative")
 
     output_dir = os.path.expanduser(args.output_dir)
     os.makedirs(output_dir, exist_ok=True)
 
-    card = EzShareCard(ip=args.card_ip, timeout=args.timeout)
+    card = EzShareCard(ip=args.card_ip, timeout=args.timeout,
+                       chunk_size=args.chunk_size, retries=args.retries)
 
     print(f"Connecting to card at {args.card_ip}...")
     version = card.ping()
